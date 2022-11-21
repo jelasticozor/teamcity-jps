@@ -1,0 +1,217 @@
+type: install
+name: TeamCity CI/CD
+baseUrl: https://raw.githubusercontent.com/jelasticozor/teamcity/main/
+logo: images/logo.png
+homepage: https://www.jetbrains.com/fr-fr/teamcity/
+
+settings:
+  fields:
+  - name: useDefaultExternalDomain
+    type: toggle
+    caption: Use Default External Domain
+    value: true
+    hidden: false
+    showIf:
+      false:
+      - name: externalDomains
+        caption: External domain names (;-separated list)
+        type: string
+        vtype: domainlist
+        required: true
+        
+globals:
+  DB_ADMIN_USERNAME: webadmin
+  TEAMCITY_USERNAME_ON_DB: teamcity
+  TEAMCITY_PASSWORD_ON_DB: ${fn.password(25)}
+  TEAMCITY_DB_NAME: teamcity
+  TEAM_CITY_SERVER_IMG: jetbrains/teamcity-server
+  TEAM_CITY_AGENT_IMG: jelasticozor/teamcity-agent
+  TEAM_CITY_IMG_TAG: "2022.10"
+  POSTGRES_JDBC_VERSION: 42.5.0
+  # these names should contain no space (should be valid folder names)
+  AGENT_1_NAME: Agent-1
+  AGENT_2_NAME: Agent-2
+  AGENT_3_NAME: Agent-3
+  TEAMCITY_PORT: 8111
+
+nodes:
+  - cloudlets: 4
+    fixedCloudlets: 1
+    nodeType: nginx-dockerized
+    nodeGroup: bl
+  - nodeGroup: storage
+    nodeType: storage
+    displayName: Configuration
+  - displayName: database
+    count: 2
+    fixedCloudlets: 3
+    cloudlets: 32
+    nodeType: postgres13
+    nodeGroup: sqldb
+    scalingMode: STATELESS
+    password: ${fn.password}
+    cluster: true
+  - nodeGroup: cp
+    nodeType: docker
+    count: 1
+    displayName: Team City Server
+    image: ${globals.TEAM_CITY_SERVER_IMG}:${globals.TEAM_CITY_IMG_TAG}
+    cloudlets: 32
+    volumes:
+      - /data/teamcity_server/datadir
+      - /opt/teamcity/logs
+    volumeMounts:
+      /data/teamcity_server/datadir:
+        sourcePath: /data/teamcity_server/datadir
+        sourceNodeGroup: storage
+        readOnly: false
+      /opt/teamcity/logs:
+        sourcePath: /opt/teamcity/logs
+        sourceNodeGroup: storage
+        readOnly: false
+  - nodeGroup: agents
+    nodeType: docker
+    count: 1
+    cloudlets: 32
+    displayName: ${globals.AGENT_1_NAME}
+    image: ${globals.TEAM_CITY_AGENT_IMG}:${globals.TEAM_CITY_IMG_TAG}-linux-sudo
+    env:
+      AGENT_NAME: ${globals.AGENT_1_NAME}
+      DOCKER_IN_DOCKER: start
+    volumes:
+      - /data/teamcity_agent/conf
+    volumeMounts:
+      /data/teamcity_agent/conf:
+        sourcePath: /data/teamcity_${globals.AGENT_1_NAME}/conf
+        sourceNodeGroup: storage
+        readOnly: false
+    startServiceOnCreation: false
+  - nodeGroup: agents
+    nodeType: docker
+    count: 1
+    cloudlets: 32
+    displayName: ${globals.AGENT_2_NAME}
+    image: ${globals.TEAM_CITY_AGENT_IMG}:${globals.TEAM_CITY_IMG_TAG}-linux-sudo
+    env:
+      AGENT_NAME: ${globals.AGENT_2_NAME}
+      DOCKER_IN_DOCKER: start
+    volumes:
+      - /data/teamcity_agent/conf
+    volumeMounts:
+      /data/teamcity_agent/conf:
+        sourcePath: /data/teamcity_${globals.AGENT_2_NAME}/conf
+        sourceNodeGroup: storage
+        readOnly: false
+    startServiceOnCreation: false
+  - nodeGroup: agents
+    nodeType: docker
+    count: 1
+    cloudlets: 32
+    displayName: ${globals.AGENT_3_NAME}
+    image: ${globals.TEAM_CITY_AGENT_IMG}:${globals.TEAM_CITY_IMG_TAG}-linux-sudo
+    env:
+      AGENT_NAME: ${globals.AGENT_3_NAME}
+      DOCKER_IN_DOCKER: start
+    volumes:
+      - /data/teamcity_agent/conf
+    volumeMounts:
+      /data/teamcity_agent/conf:
+        sourcePath: /data/teamcity_${globals.AGENT_3_NAME}/conf
+        sourceNodeGroup: storage
+        readOnly: false
+    startServiceOnCreation: false
+skipNodeEmails: true
+
+onInstall:
+  - computeOptionalParams
+  - createDatabaseForTeamCity
+  - installPostgresJdbc
+  - linkTeamCityWithPostgresDatabase
+  - linkAgentsWithServer
+  - startAgents
+  - installAddon:
+      id: letsencrypt
+      settings:
+        externalDomains: ${globals.EXTERNAL_DOMAINS}
+  - closeFromOutsideWorld:
+      nodeGroup: sqldb
+      relatedNodeGroup: cp
+  - closeFromOutsideWorld:
+      nodeGroup: agents
+      relatedNodeGroup: cp
+  - closeFromOutsideWorld:
+      nodeGroup: cp
+      relatedNodeGroup: bl
+  - autoRedirectToHttps
+
+actions:
+  computeOptionalParams:
+    - script: |
+        return {
+          result: 0,
+          externalDomains: ${settings.useDefaultExternalDomain} ? "${env.domain}" : "${settings.externalDomains}",
+        };
+    - setGlobals:
+        EXTERNAL_DOMAINS: ${response.externalDomains}
+  createDatabaseForTeamCity:
+    - cmd[${nodes.sqldb.master.id}]:
+        - export PGPASSWORD=${nodes.sqldb.password}
+        - psql -U ${globals.DB_ADMIN_USERNAME} -d postgres -c "CREATE USER ${globals.TEAMCITY_USERNAME_ON_DB} PASSWORD '${globals.TEAMCITY_PASSWORD_ON_DB}';"
+        - psql -U ${globals.DB_ADMIN_USERNAME} -d postgres -c "CREATE DATABASE ${globals.TEAMCITY_DB_NAME} OWNER ${globals.TEAMCITY_USERNAME_ON_DB} ENCODING 'utf-8' TEMPLATE template0;"
+  installPostgresJdbc:
+    - cmd[storage]:
+        - mkdir -p /data/teamcity_server/datadir/lib/jdbc
+        - wget https://jdbc.postgresql.org/download/postgresql-${globals.POSTGRES_JDBC_VERSION}.jar -O /data/teamcity_server/datadir/lib/jdbc/postgresql-${globals.POSTGRES_JDBC_VERSION}.jar
+    - cmd[cp]: chown tcuser:tcuser -R /data/teamcity_server/datadir/lib
+  linkTeamCityWithPostgresDatabase:
+    - cmd[storage]:
+        - mkdir -p /data/teamcity_server/datadir/config
+        - wget ${baseUrl}/config/database.properties -O /data/teamcity_server/datadir/config/database.properties
+        - sed -i "s/SQL_HOSTNAME/${nodes.sqldb.master.intIP}/g" /data/teamcity_server/datadir/config/database.properties
+        - sed -i "s/TEAMCITY_DB_NAME/${globals.TEAMCITY_DB_NAME}/g" /data/teamcity_server/datadir/config/database.properties
+        - sed -i "s/TEAMCITY_USERNAME/${globals.TEAMCITY_USERNAME_ON_DB}/g" /data/teamcity_server/datadir/config/database.properties
+        - sed -i "s/TEAMCITY_PASSWORD/${globals.TEAMCITY_PASSWORD_ON_DB}/g" /data/teamcity_server/datadir/config/database.properties
+    - cmd[cp]: chown tcuser:tcuser -R /data/teamcity_server/datadir/config
+  linkAgentsWithServer:
+    - api:
+        - method: environment.control.AddContainerEnvVars
+          params:
+            nodeGroup: agents
+            vars:
+              SERVER_URL: http://${nodes.cp.master.intIP}:${globals.TEAMCITY_PORT}
+  startAgents:
+    - env.control.ExecDockerRunCmd [${nodes.agents.join(id,)}]
+    - restartContainers[agents]
+  closeFromOutsideWorld:
+    # it is not possible to access it more directly through a submodule
+    script: https://raw.githubusercontent.com/jelasticozor/jelastic-common/master/security/closeNodeGroupFromOutsideWorld.js
+    nodeGroup: ${this.nodeGroup}
+    relatedNodeGroup: ${this.relatedNodeGroup}
+  autoRedirectToHttps:
+    - cmd[bl]: wget ${baseUrl}/config/nginx/ssl.conf -O /etc/nginx/conf.d/ssl.conf
+    - cmd[bl]:
+        - sed -i '/#GFADMIN/,/TCP\ SECTION\ PROTOTYPE/d' /etc/nginx/nginx-jelastic.conf
+        - wget ${baseUrl}/config/nginx/https_redirection.conf -O /tmp/https_redirection.conf
+        - cat /tmp/https_redirection.conf >> /etc/nginx/nginx-jelastic.conf
+      user: root
+    - restartContainers[bl]
+
+addons:
+  - id: letsencrypt
+    name: letsencrypt
+    onInstall:
+      - install:
+          envName: ${env.envName}
+          nodeGroup: bl
+          jps: https://github.com/jelastic-jps/lets-encrypt/blob/master/manifest.jps
+          settings:
+            customDomains: ${settings.externalDomains}
+
+success:
+  text: |
+    **TeamCity Access**: [${env.protocol}://${env.domain}/](${env.protocol}://${env.domain}/)  
+    **Database Admin Panel**: [${nodes.sqldb.master.url}](${nodes.sqldb.master.url})  
+    **Database Admin User**: ${globals.DB_ADMIN_USERNAME}  
+    **Database Admin Password**: ${nodes.sqldb.password}  
+    **Teamcity User on DB**: ${globals.TEAMCITY_USERNAME_ON_DB}  
+    **Teamcity Password on DB**: ${globals.TEAMCITY_PASSWORD_ON_DB}
